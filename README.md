@@ -1,6 +1,6 @@
 # Stereo Vision Depth Estimation Project
 
-This project implements stereo vision for depth estimation using OpenCV and MediaPipe.
+This project implements stereo vision for depth estimation using OpenCV and YOLO object detection.
 
 ## Setup
 
@@ -66,9 +66,18 @@ conda activate stereo_vision
 - **OpenCV**: Computer vision operations
 - **NumPy**: Numerical computations
 - **Matplotlib**: Plotting and visualization
-- **MediaPipe**: Hand/pose detection (if used)
+- **Ultralytics YOLO**: Object detection model
+- **PyTorch**: Deep learning backend for YOLO
 - **imutils**: Image processing utilities
 - **SciPy**: Scientific computing
+
+## Features
+
+- **Real-time object detection**: Uses YOLOv8 nano model for fast and accurate object detection
+- **Stereo depth estimation**: Calculates distance to detected objects using stereo vision
+- **Confidence filtering**: Only processes objects with >51% confidence threshold
+- **Top-5 detection**: Shows the 5 most confident detections per frame
+- **Multi-object support**: Can detect and track multiple object types simultaneously
 
 ## Calibration
 
@@ -76,12 +85,17 @@ The project uses chessboard calibration with a **5x10** inner corner pattern (6x
 
 ## Troubleshooting
 
-1. **MediaPipe installation issues**: Make sure you're using Python 3.11 or 3.12 (not 3.13)
-2. **Calibration failing**: Verify chessboard size matches your actual calibration pattern
-3. **Import errors**: Make sure the conda environment is activated
+1. **YOLO model download**: On first run, YOLOv8 model will be automatically downloaded
+2. **PyTorch installation**: If conda fails to install PyTorch, it will be installed via pip
+3. **Calibration failing**: Verify chessboard size matches your actual calibration pattern
+4. **Import errors**: Make sure the conda environment is activated
+5. **Low detection accuracy**: Adjust confidence threshold in stereoVision.py (currently set to 51%)
 
 ## Notes
 
 - The calibration parameters are saved in `stereo_map.xml`
 - Both `calibration.py` and `triangulation.py` modules were created to support the main application
-- The project is configured to work with Python 3.11 for maximum compatibility
+- The project uses YOLOv8 nano model for optimal speed/accuracy balance
+- YOLO model weights are automatically downloaded on first run
+- The system filters detections to show only objects with >51% confidence
+- Supports detection of 80+ object classes (COCO dataset)
