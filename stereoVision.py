@@ -27,37 +27,80 @@ stereo = cv2.StereoSGBM_create(
     mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY
 )
 
-# Initialize feature detector (ORB is fast and accurate)
-orb = cv2.ORB_create(nfeatures=1000)  # Increased features for better matching
-bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-
-# Initialize WLS filter for disparity post-processing
-left_matcher = stereo
-right_matcher = cv2.ximgproc.createRightMatcher(left_matcher)
-wls_filter = cv2.ximgproc.createDisparityWLSFilter(matcher_left=left_matcher)
-wls_filter.setLambda(80000)
-wls_filter.setSigmaColor(1.2)
-
-def create_depth_colormap(disparity, gray_left, gray_right):
-    """Create a colored depth map similar to the reference image"""
-    try:
-        # Apply WLS filter for better disparity quality
-        disparity_right = right_matcher.compute(gray_right, gray_left)
-        disparity_filtered = wls_filter.filter(disparity, gray_left, None, disparity_right)
-    except:
-        # Fallback to original disparity if WLS filtering fails
-        disparity_filtered = disparity
+def create_depth_colormap(disparity):
+    """Create a colored depth map with proper depth scaling"""
+    # Clip negative disparities and normalize
+    disparity_clipped = np.clip(disparity, 0, None)
     
     # Normalize disparity to 0-255 range
-    disparity_normalized = cv2.normalize(disparity_filtered, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    disparity_normalized = cv2.normalize(disparity_clipped, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
     
     # Apply color map (JET colormap for heat-like visualization)
     depth_colored = cv2.applyColorMap(disparity_normalized, cv2.COLORMAP_JET)
     
-    # Enhance the visualization with bilateral filter
-    depth_colored = cv2.bilateralFilter(depth_colored, 9, 75, 75)
+    return depth_colored, disparity_normalized
+
+def detect_objects_in_depth(disparity, focal_length=600, baseline=0.05):
+    """Detect objects using blob detection on the depth map"""
+    # Convert disparity to actual depth in meters
+    # depth = (focal_length * baseline) / disparity
+    # But we'll work directly with disparity for blob detection
     
-    return depth_colored
+    # Clip and normalize disparity
+    disparity_clipped = np.clip(disparity, 1, None)  # Avoid division by zero
+    disparity_normalized = cv2.normalize(disparity_clipped, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    
+    # Apply filters to clean up the depth map
+    filtered = cv2.medianBlur(disparity_normalized, 15)
+    filtered = cv2.GaussianBlur(filtered, (9, 9), 0)
+    
+    # Create binary mask for objects at reasonable distances
+    # Higher disparity = closer objects
+    close_mask = cv2.inRange(filtered, 30, 255)  # Focus on closer objects
+    
+    # Morphological operations to clean up blobs
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    close_mask = cv2.morphologyEx(close_mask, cv2.MORPH_CLOSE, kernel)
+    close_mask = cv2.morphologyEx(close_mask, cv2.MORPH_OPEN, kernel)
+    
+    # Find contours (blobs)
+    contours, _ = cv2.findContours(close_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    objects = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area > 1000:  # Filter small noise
+            # Get bounding rectangle
+            x, y, w, h = cv2.boundingRect(contour)
+            
+            # Calculate center point
+            center_x = x + w // 2
+            center_y = y + h // 2
+            
+            # Get average disparity in the blob region
+            roi_disparity = disparity_clipped[y:y+h, x:x+w]
+            mask_roi = close_mask[y:y+h, x:x+w]
+            
+            if np.sum(mask_roi) > 0:
+                avg_disparity = np.mean(roi_disparity[mask_roi > 0])
+                
+                # Convert disparity to depth (improved calculation)
+                if avg_disparity > 0:
+                    # Use a more realistic focal length and baseline for depth calculation
+                    depth_cm = (focal_length * baseline * 100) / (avg_disparity / 16.0)  # SGBM disparity is scaled by 16
+                    
+                    # Clamp to reasonable range
+                    depth_cm = max(10, min(depth_cm, 500))  # Between 10cm and 5m
+                    
+                    objects.append({
+                        'center': (center_x, center_y),
+                        'bbox': (x, y, w, h),
+                        'area': area,
+                        'depth': depth_cm,
+                        'disparity': avg_disparity
+                    })
+    
+    return objects, close_mask
 
 print("Stereo system initialized successfully")
 
@@ -138,97 +181,72 @@ while (cap_right.isOpened() and cap_left.isOpened()):
         disparity = stereo.compute(gray_left, gray_right)
         
         # Create enhanced depth visualization
-        depth_colored = create_depth_colormap(disparity, gray_left, gray_right)
+        depth_colored, disparity_normalized = create_depth_colormap(disparity)
         
-        # Find keypoints and descriptors using ORB
-        kp_right, des_right = orb.detectAndCompute(gray_right, None)
-        kp_left, des_left = orb.detectAndCompute(gray_left, None)
+        # Detect objects using blob detection on depth map
+        detected_objects, object_mask = detect_objects_in_depth(disparity)
         
-        # Match features between left and right images
-        matches = []
-        if des_right is not None and des_left is not None and len(kp_right) > 0 and len(kp_left) > 0:
-            matches = bf.match(des_right, des_left)
-            matches = sorted(matches, key=lambda x: x.distance)
+        # Create display frames
+        display_left = frame_left.copy()
+        display_right = frame_right.copy()
+        
+        # Draw detected objects
+        for i, obj in enumerate(detected_objects):
+            center = obj['center']
+            bbox = obj['bbox']
+            depth = obj['depth']
             
-            # Keep only good matches (top 50 or those with distance < threshold)
-            good_matches = matches[:min(50, len(matches))]
-            good_matches = [m for m in good_matches if m.distance < 50]
-        else:
-            good_matches = []
-        
-        # Draw matched features and calculate depths
-        matched_frame_right = frame_right.copy()
-        matched_frame_left = frame_left.copy()
-        
-        depth_measurements = []
-        
-        for i, match in enumerate(good_matches[:20]):  # Process top 20 matches
-            # Check bounds to prevent overflow
-            if match.queryIdx >= len(kp_right) or match.trainIdx >= len(kp_left):
-                continue
-                
-            # Get coordinates of matched points
-            pt_right = kp_right[match.queryIdx].pt
-            pt_left = kp_left[match.trainIdx].pt
+            # Draw bounding box
+            cv2.rectangle(display_left, (bbox[0], bbox[1]), (bbox[0]+bbox[2], bbox[1]+bbox[3]), (0, 255, 0), 2)
+            cv2.rectangle(display_right, (bbox[0], bbox[1]), (bbox[0]+bbox[2], bbox[1]+bbox[3]), (0, 255, 0), 2)
             
-            # Only process if the match makes sense (left point should be to the left)
-            if pt_left[0] < pt_right[0]:
-                # Calculate depth using triangulation
-                depth = tri.find_depth(pt_right, pt_left, frame_right, frame_left, B, f, alpha)
-                
-                if depth > 0 and depth < 1000:  # Filter out unrealistic depths
-                    depth_measurements.append({
-                        'point_right': pt_right,
-                        'point_left': pt_left,
-                        'depth': depth,
-                        'quality': 1.0 / (match.distance + 1)  # Higher quality for lower distance
-                    })
-                    
-                    # Draw circles on detected points
-                    cv2.circle(matched_frame_right, (int(pt_right[0]), int(pt_right[1])), 8, (0, 255, 0), 2)
-                    cv2.circle(matched_frame_left, (int(pt_left[0]), int(pt_left[1])), 8, (0, 255, 0), 2)
-                    
-                    # Draw depth information
-                    cv2.putText(matched_frame_right, f"{depth:.1f}cm", 
-                               (int(pt_right[0] + 10), int(pt_right[1] - 10)), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                    
-                    print(f"Object detected at depth: {depth:.2f}cm")
+            # Draw center point
+            cv2.circle(display_left, center, 8, (0, 0, 255), -1)
+            cv2.circle(display_right, center, 8, (0, 0, 255), -1)
+            
+            # Draw depth information
+            depth_text = f"{depth:.1f}cm"
+            cv2.putText(display_left, depth_text, (center[0] + 10, center[1] - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(display_right, depth_text, (center[0] + 10, center[1] - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            print(f"Object {i+1} detected at depth: {depth:.1f}cm")
         
-        # Add detection count and statistics
-        num_detections = len(depth_measurements)
-        if num_detections > 0:
-            depths = [d['depth'] for d in depth_measurements]
+        # Add detection statistics
+        num_objects = len(detected_objects)
+        if num_objects > 0:
+            depths = [obj['depth'] for obj in detected_objects]
             avg_depth = np.mean(depths)
             min_depth = np.min(depths)
             max_depth = np.max(depths)
             
-            cv2.putText(matched_frame_right, f"Objects: {num_detections}", (50, 50), 
+            cv2.putText(display_left, f"Objects: {num_objects}", (10, 30), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(matched_frame_right, f"Avg: {avg_depth:.1f}cm", (50, 80), 
+            cv2.putText(display_left, f"Closest: {min_depth:.1f}cm", (10, 60), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(matched_frame_right, f"Range: {min_depth:.1f}-{max_depth:.1f}cm", (50, 110), 
+            cv2.putText(display_left, f"Farthest: {max_depth:.1f}cm", (10, 90), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         else:
-            cv2.putText(matched_frame_right, "No objects detected", (50, 50), 
+            cv2.putText(display_left, "No objects detected", (10, 30), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            cv2.putText(matched_frame_left, "No objects detected", (50, 50), 
+            cv2.putText(display_right, "No objects detected", (10, 30), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         
         end = time.time()
         totalTime = end - start
         fps = 1 / totalTime
         
-        cv2.putText(matched_frame_right, f"FPS: {int(fps)}", (50, matched_frame_right.shape[0]-30), 
+        cv2.putText(display_right, f"FPS: {int(fps)}", (50, display_right.shape[0]-30), 
                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        cv2.putText(matched_frame_left, f"FPS: {int(fps)}", (50, matched_frame_left.shape[0]-30), 
+        cv2.putText(display_left, f"FPS: {int(fps)}", (50, display_left.shape[0]-30), 
                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
         cv2.putText(depth_colored, f"FPS: {int(fps)}", (50, depth_colored.shape[0]-30), 
                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
         
         # Display windows
-        cv2.imshow("Right Camera", matched_frame_right)
-        cv2.imshow("Left Camera", matched_frame_left)
+        cv2.imshow("Right Camera", display_right)
+        cv2.imshow("Left Camera", display_left)
         cv2.imshow("Depth Map", depth_colored)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
